@@ -343,6 +343,7 @@ class LLMAnalyzer
         ];
 
         foreach ($keywords as $kw) {
+            // Build prompt for main query
             $prompt = $promptBuilder($kw, $daysLookback);
 
             $payload = $basePayload;
@@ -364,6 +365,18 @@ class LLMAnalyzer
             }
 
             $analysis = $this->analyzeListText($text, $website, $company, $competitors);
+
+            // ACTIVE COMPETITOR QUERYING: Query each competitor separately
+            $analysis['competitorMentions'] = $this->queryCompetitors(
+                $platformName,
+                $url,
+                $authHeader,
+                $basePayload,
+                $competitors,
+                $kw,
+                $daysLookback
+            );
+
             $results['keywordResults'][$kw] = $analysis;
 
             if (!empty($analysis['mentioned'])) {
@@ -379,6 +392,78 @@ class LLMAnalyzer
 
         $results['score'] = $this->platformScore($results, count($keywords));
         return $results;
+    }
+
+    /**
+     * Actively query each competitor to get accurate mention counts
+     */
+    private function queryCompetitors(
+        string $platformName,
+        string $url,
+        string $authHeader,
+        array $basePayload,
+        array $competitors,
+        string $keyword,
+        int $daysLookback
+    ): array {
+        $competitorResults = [];
+
+        foreach ($competitors as $competitorUrl) {
+            $domain = $this->domain($competitorUrl);
+            if (!$domain) continue;
+
+            // Ask LLM directly: "Is this competitor associated with this keyword?"
+            $evalPrompt = "Evaluate whether '{$domain}' is associated with the keyword '{$keyword}'.
+
+Consider information from the last {$daysLookback} days.
+
+Answer in this EXACT format (choose ONE):
+YES - {$domain} is strongly associated with '{$keyword}'
+NO - {$domain} is not associated with '{$keyword}'
+
+If {$domain} is relevant to {$keyword} in any business context, answer YES.
+Be factual but not overly restrictive.
+Output ONLY: YES or NO (nothing else).";
+
+            $payload = $basePayload;
+            $payload['messages'] = [
+                ['role' => 'user', 'content' => $evalPrompt]
+            ];
+
+            try {
+                $resp = $this->curl_json($url, [
+                    'Content-Type: application/json',
+                    $authHeader
+                ], $payload);
+
+                $text = '';
+                if ($platformName === 'OpenAI' || $platformName === 'Perplexity') {
+                    $text = $resp['json']['choices'][0]['message']['content'] ?? '';
+                }
+
+                // Check if response indicates relevance
+                $mentioned = stripos($text, 'YES') !== false;
+
+                $competitorResults[] = [
+                    'domain'    => $domain,
+                    'mentioned' => $mentioned,
+                    'response'  => trim($text)
+                ];
+
+                // Rate limiting between competitor queries
+                usleep(200000);
+
+            } catch (Throwable $e) {
+                error_log("Competitor query failed for {$domain}: " . $e->getMessage());
+                $competitorResults[] = [
+                    'domain'    => $domain,
+                    'mentioned' => false,
+                    'error'     => $e->getMessage()
+                ];
+            }
+        }
+
+        return $competitorResults;
     }
 
     /* -------- platform callers (balanced, non-hallucinatory prompts) -------- */
@@ -539,6 +624,10 @@ Return ONLY:
             $text = $resp['json']['candidates'][0]['content']['parts'][0]['text'] ?? '';
 
             $analysis = $this->analyzeListText($text, $website, $company, $competitors);
+
+            // ACTIVE COMPETITOR QUERYING for Gemini
+            $analysis['competitorMentions'] = $this->queryCompetitorsGemini($url, $competitors, $kw, $daysLookback);
+
             $results['keywordResults'][$kw] = $analysis;
 
             if (!empty($analysis['mentioned'])) {
@@ -554,6 +643,60 @@ Return ONLY:
 
         $results['score'] = $this->platformScore($results, count($keywords));
         return $results;
+    }
+
+    /**
+     * Query competitors specifically for Gemini API
+     */
+    private function queryCompetitorsGemini(string $url, array $competitors, string $keyword, int $daysLookback): array
+    {
+        $competitorResults = [];
+
+        foreach ($competitors as $competitorUrl) {
+            $domain = $this->domain($competitorUrl);
+            if (!$domain) continue;
+
+            $evalPrompt = "Evaluate whether '{$domain}' is associated with the keyword '{$keyword}'.
+
+Consider information from the last {$daysLookback} days.
+
+Answer in this EXACT format (choose ONE):
+YES - {$domain} is strongly associated with '{$keyword}'
+NO - {$domain} is not associated with '{$keyword}'
+
+If {$domain} is relevant to {$keyword} in any business context, answer YES.
+Be factual but not overly restrictive.
+Output ONLY: YES or NO (nothing else).";
+
+            $payload = [
+                'contents' => [[ 'parts' => [['text' => $evalPrompt]] ]]
+            ];
+
+            try {
+                $resp = $this->curl_json($url, ['Content-Type: application/json'], $payload);
+                $text = $resp['json']['candidates'][0]['content']['parts'][0]['text'] ?? '';
+
+                $mentioned = stripos($text, 'YES') !== false;
+
+                $competitorResults[] = [
+                    'domain'    => $domain,
+                    'mentioned' => $mentioned,
+                    'response'  => trim($text)
+                ];
+
+                usleep(200000);
+
+            } catch (Throwable $e) {
+                error_log("Gemini competitor query failed for {$domain}: " . $e->getMessage());
+                $competitorResults[] = [
+                    'domain'    => $domain,
+                    'mentioned' => false,
+                    'error'     => $e->getMessage()
+                ];
+            }
+        }
+
+        return $competitorResults;
     }
 
     private function q_claude(string $website, string $company, array $competitors, array $keywords, int $daysLookback): array
@@ -615,6 +758,10 @@ Competitors: {$compList}
             $text = $resp['json']['content'][0]['text'] ?? '';
 
             $analysis = $this->analyzeListText($text, $website, $company, $competitors);
+
+            // ACTIVE COMPETITOR QUERYING for Claude
+            $analysis['competitorMentions'] = $this->queryCompetitorsClaude($url, $model, $headers, $competitors, $kw, $daysLookback);
+
             $results['keywordResults'][$kw] = $analysis;
 
             if (!empty($analysis['mentioned'])) {
@@ -630,6 +777,64 @@ Competitors: {$compList}
 
         $results['score'] = $this->platformScore($results, count($keywords));
         return $results;
+    }
+
+    /**
+     * Query competitors specifically for Claude API
+     */
+    private function queryCompetitorsClaude(string $url, string $model, array $headers, array $competitors, string $keyword, int $daysLookback): array
+    {
+        $competitorResults = [];
+
+        foreach ($competitors as $competitorUrl) {
+            $domain = $this->domain($competitorUrl);
+            if (!$domain) continue;
+
+            $evalPrompt = "Evaluate whether '{$domain}' is associated with the keyword '{$keyword}'.
+
+Consider information from the last {$daysLookback} days.
+
+Answer in this EXACT format (choose ONE):
+YES - {$domain} is strongly associated with '{$keyword}'
+NO - {$domain} is not associated with '{$keyword}'
+
+If {$domain} is relevant to {$keyword} in any business context, answer YES.
+Be factual but not overly restrictive.
+Output ONLY: YES or NO (nothing else).";
+
+            $payload = [
+                'model'      => $model,
+                'max_tokens' => 100,
+                'messages'   => [
+                    ['role' => 'user', 'content' => $evalPrompt]
+                ]
+            ];
+
+            try {
+                $resp = $this->curl_json($url, $headers, $payload);
+                $text = $resp['json']['content'][0]['text'] ?? '';
+
+                $mentioned = stripos($text, 'YES') !== false;
+
+                $competitorResults[] = [
+                    'domain'    => $domain,
+                    'mentioned' => $mentioned,
+                    'response'  => trim($text)
+                ];
+
+                usleep(200000);
+
+            } catch (Throwable $e) {
+                error_log("Claude competitor query failed for {$domain}: " . $e->getMessage());
+                $competitorResults[] = [
+                    'domain'    => $domain,
+                    'mentioned' => false,
+                    'error'     => $e->getMessage()
+                ];
+            }
+        }
+
+        return $competitorResults;
     }
 
     /* ---- HTTP helper ---- */
@@ -659,13 +864,13 @@ Competitors: {$compList}
     }
 
     /* ---- analysis helpers ---- */
-    private function analyzeListText(string $content, string $website, string $company, array $competitors): array
+    private function analyzeListText(string $content, string $website, string $company, array $competitors = []): array
     {
         // We expect lines like: "1. Company — domain.tld"
         $result = [
             'mentioned'          => false,
             'position'           => null,
-            'competitorMentions' => [],
+            'competitorMentions' => [], // Will be populated by active querying
             'responseLength'     => strlen($content),
             'confidence'         => 0.2
         ];
@@ -696,13 +901,9 @@ Competitors: {$compList}
             }
         }
 
-        foreach ($competitors as $c) {
-            $cd = $this->domain($c);
-            $result['competitorMentions'][] = [
-                'domain'    => $cd,
-                'mentioned' => $cd ? (stripos($content, $cd) !== false) : false
-            ];
-        }
+        // NOTE: competitorMentions will be populated by active querying methods
+        // (queryCompetitors, queryCompetitorsGemini, queryCompetitorsClaude)
+        // We no longer do passive competitor detection here
 
         return $result;
     }
